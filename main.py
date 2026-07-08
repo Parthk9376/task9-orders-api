@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from typing import Optional
 import time
 
@@ -15,45 +16,39 @@ app.add_middleware(
 
 TOTAL_ORDERS = 45
 RATE_LIMIT = 18
-WINDOW = 10  # seconds
+WINDOW = 10
 
-# Fixed orders for pagination
+# Orders 1..45
 orders = [{"id": i} for i in range(1, TOTAL_ORDERS + 1)]
 
-# Idempotency storage
-idempotency_store = {}
+# Idempotency store
+idempotency = {}
 next_order_id = TOTAL_ORDERS + 1
 
-# Rate limit storage
-client_requests = {}
+# Per-client timestamps
+rate_limits = {}
 
 
 def check_rate_limit(client_id: str):
     now = time.time()
 
-    if client_id not in client_requests:
-        client_requests[client_id] = []
+    timestamps = rate_limits.setdefault(client_id, [])
 
-    # Remove expired timestamps
-    client_requests[client_id] = [
-        t for t in client_requests[client_id]
-        if now - t < WINDOW
-    ]
+    # Remove timestamps older than WINDOW
+    while timestamps and now - timestamps[0] >= WINDOW:
+        timestamps.pop(0)
 
-    # Rate limit reached
-    if len(client_requests[client_id]) >= RATE_LIMIT:
-        retry_after = max(
-            1,
-            int(WINDOW - (now - client_requests[client_id][0])) + 1
-        )
+    if len(timestamps) >= RATE_LIMIT:
+        retry = max(1, int(WINDOW - (now - timestamps[0])) + 1)
 
-        raise HTTPException(
+        return JSONResponse(
             status_code=429,
-            detail="Rate limit exceeded",
-            headers={"Retry-After": str(retry_after)}
+            content={"detail": "Rate limit exceeded"},
+            headers={"Retry-After": str(retry)},
         )
 
-    client_requests[client_id].append(now)
+    timestamps.append(now)
+    return None
 
 
 @app.get("/")
@@ -61,45 +56,46 @@ def root():
     return {"status": "ok"}
 
 
-@app.post("/orders", status_code=201)
+@app.post("/orders")
 def create_order(
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
-    client_id: str = Header("default", alias="X-Client-Id"),
+    x_client_id: str = Header(..., alias="X-Client-Id"),
 ):
     global next_order_id
 
-    check_rate_limit(client_id)
+    limited = check_rate_limit(x_client_id)
+    if limited:
+        return limited
 
-    # Same key → same order id
-    if idempotency_key in idempotency_store:
-        return {"id": idempotency_store[idempotency_key]}
+    if idempotency_key in idempotency:
+        return {"id": idempotency[idempotency_key]}
 
     order_id = next_order_id
     next_order_id += 1
 
-    idempotency_store[idempotency_key] = order_id
+    idempotency[idempotency_key] = order_id
 
-    return {"id": order_id}
+    return JSONResponse(
+        status_code=201,
+        content={"id": order_id},
+    )
 
 
 @app.get("/orders")
 def list_orders(
     limit: int = 10,
     cursor: Optional[str] = None,
-    client_id: str = Header("default", alias="X-Client-Id"),
+    x_client_id: str = Header(..., alias="X-Client-Id"),
 ):
-    check_rate_limit(client_id)
+    limited = check_rate_limit(x_client_id)
+    if limited:
+        return limited
 
-    if limit <= 0:
+    if limit < 1:
         limit = 10
 
-    try:
-        start = int(cursor) if cursor else 0
-    except ValueError:
-        start = 0
-
-    if start < 0:
-        start = 0
+    start = int(cursor) if cursor else 0
+    start = max(0, start)
 
     end = min(start + limit, TOTAL_ORDERS)
 
@@ -109,5 +105,5 @@ def list_orders(
 
     return {
         "items": items,
-        "next_cursor": next_cursor
+        "next_cursor": next_cursor,
     }
