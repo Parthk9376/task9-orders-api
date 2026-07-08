@@ -1,11 +1,10 @@
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import time
 
 app = FastAPI()
 
-# Allow CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,13 +13,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Assigned values
 TOTAL_ORDERS = 45
 RATE_LIMIT = 18
 WINDOW = 10  # seconds
 
-# Fixed catalog of orders (IDs 1..45)
-catalog = [{"id": i} for i in range(1, TOTAL_ORDERS + 1)]
+# Fixed orders for pagination
+orders = [{"id": i} for i in range(1, TOTAL_ORDERS + 1)]
 
 # Idempotency storage
 idempotency_store = {}
@@ -30,25 +28,30 @@ next_order_id = TOTAL_ORDERS + 1
 client_requests = {}
 
 
-def check_rate_limit(client_id: str, response: Response):
+def check_rate_limit(client_id: str):
     now = time.time()
 
     if client_id not in client_requests:
         client_requests[client_id] = []
 
-    # Keep only requests within last WINDOW seconds
+    # Remove expired timestamps
     client_requests[client_id] = [
         t for t in client_requests[client_id]
         if now - t < WINDOW
     ]
 
+    # Rate limit reached
     if len(client_requests[client_id]) >= RATE_LIMIT:
         retry_after = max(
             1,
-            int(WINDOW - (now - client_requests[client_id][0]))
+            int(WINDOW - (now - client_requests[client_id][0])) + 1
         )
-        response.headers["Retry-After"] = str(retry_after)
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded",
+            headers={"Retry-After": str(retry_after)}
+        )
 
     client_requests[client_id].append(now)
 
@@ -60,15 +63,14 @@ def root():
 
 @app.post("/orders", status_code=201)
 def create_order(
-    response: Response,
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
     client_id: str = Header("default", alias="X-Client-Id"),
 ):
     global next_order_id
 
-    check_rate_limit(client_id, response)
+    check_rate_limit(client_id)
 
-    # Return existing order for same idempotency key
+    # Same key → same order id
     if idempotency_key in idempotency_store:
         return {"id": idempotency_store[idempotency_key]}
 
@@ -82,21 +84,26 @@ def create_order(
 
 @app.get("/orders")
 def list_orders(
-    response: Response,
     limit: int = 10,
     cursor: Optional[str] = None,
     client_id: str = Header("default", alias="X-Client-Id"),
 ):
-    check_rate_limit(client_id, response)
+    check_rate_limit(client_id)
+
+    if limit <= 0:
+        limit = 10
 
     try:
         start = int(cursor) if cursor else 0
     except ValueError:
         start = 0
 
+    if start < 0:
+        start = 0
+
     end = min(start + limit, TOTAL_ORDERS)
 
-    items = catalog[start:end]
+    items = orders[start:end]
 
     next_cursor = str(end) if end < TOTAL_ORDERS else None
 
